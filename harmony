@@ -1,0 +1,206 @@
+#!/usr/bin/env ruby
+require 'set'
+require 'rtmidi'  # nix-shell -p jack2Full ; gem install rtmidi
+require 'concurrent' # gem install concurrent-ruby
+
+def select_port(midiio)
+  kind = midiio.class.name.sub('RtMidi::','') #.downcase
+  loop do
+    puts "Available MIDI #{kind} ports"
+    midiio.port_names.each_with_index{|name,index| printf "%3i: %s\n", index, name }
+    print "Select a port number: "
+    if (port = gets) =~ /^\d+$/
+      return port.to_i if (0...midiio.port_count).include? port.to_i
+    else
+      puts "Invalid port number"
+    end
+  end
+end
+
+def port_for_name(midiio, name)
+  midiio.port_names.find_index{|x| x.include? name}
+end
+
+def base_freq; 440 ; end
+def base_midi_note; 69 ; end
+
+def midi_to_freq(note)
+  440.0 * (2**((note - 69.0)/12))
+end
+
+# set pitchband range: https://www.midikits.net/midi_analyser/pitch_bend.htm
+
+def freq_to_midi(freq)
+  negative_octaves = 10 # Math.log2 don't return negative numbers, this compensates for it
+  octaves_from_base = Math.log2((2**negative_octaves)*freq/base_freq) - negative_octaves
+  midi_note_float = octaves_from_base * 12 + base_midi_note
+  midi_note = midi_note_float.round
+  direction_bend_semitones = 2
+  max_direction_bend = bend_zero = 8192
+  bend_value = ((max_direction_bend / direction_bend_semitones) * (midi_note_float - midi_note)).round + bend_zero
+  [midi_note, bend_value]
+end
+
+def bend_bytes(val)
+  msb = val >> 7
+  lsb = val - (msb << 7)
+  [lsb, msb]
+end
+
+def speed_of_sound ; 343.0; end # dry air, 20 degrees celsius
+def wavelength(frequency); speed_of_sound/frequency ; end
+def freq(wavelength); speed_of_sound/wavelength ; end
+
+def display(prefix,x)
+  puts "#{prefix}: #{x.map{|x| x.to_s(16).rjust(2,'0')}.join(' ')}"
+end
+
+def demo
+  for pitch in [60, 62, 64, 65, 67]
+    @midiout.send_channel_message(0x90, pitch, 127) # note on
+    sleep 0.5
+    @midiout.send_channel_message(0x90, pitch, 0) # note off
+  end
+  sleep 0.5
+end
+
+def len(x=8) ; sleep 1.5/x; end
+
+def send_msg(b1,b2,b3)
+  puts "%x %x %x" % [b1,b2,b3]
+  @midiout.send_channel_message(b1, b2, b3)
+end
+
+def freq_on(f,locker)
+  chan = lock_channel(locker)
+  note, bend = freq_to_midi(f)
+  send_msg(0xE0+chan, *bend_bytes(bend))
+  send_msg(0x90+chan, note, 127)
+end
+
+def freq_off(f,locker)
+  chan = 
+  note, bend = freq_to_midi(f)
+  send_msg(0x90+chan, note, 0) # note off
+  send_msg(0xE0+chan, 0x00, 0x40)
+end
+
+def play_freq(f, chan=0)
+  freq_on(f,chan)
+  block_given? ? yield : len
+  freq_off(f,chan)
+end
+
+def play_wl(wl,&block)
+  play_freq(freq(wl),&block)
+end
+
+@base_freq = 44
+
+def play_steps
+  f = @base_freq
+  # [1, 2, 3, 4, 5, 4, 3, 2, 1].each do |x|
+  #   play_freq(@base_freq*x, 0){len 3}
+  # end
+  [[5,6],[4,6],[4,5],[7,6],[4,5]].each do |orig,new|
+    freq_on(f*2,1)
+    puts "on #{f*2}"
+    10.times do |x|
+      play_freq(f*(2 + rand(5)), 0)
+    end
+    play_freq(f*orig)
+    freq_off(f*2,1)
+    puts "off #{f*2}"
+    f *= orig.to_f/new.to_f
+  end
+  play_freq(f)
+end
+
+def init_in
+  @midiin = RtMidi::In.new
+  in_port   = port_for_name(@midiin, 'Launchpad Mini')
+  in_port ||= port_for_name(@midiin, 'Lightpad BLOCK')
+  in_port ||=   select_port(@midiin)
+  @midiin.open_port(in_port)
+end
+
+def panic
+  (0x0..0xf).each do |chan|
+    @midiout.send_channel_message(0xE0 + chan, 0x00, 0x40)
+    (0..127).each{|note| @midiout.send_channel_message(0x80 + chan, note, 0)}
+  end
+end
+
+def init_out
+  @midiout = RtMidi::Out.new
+  out_port ||= port_for_name(@midiout, 'VirMIDI 1-0')
+  out_port ||=   select_port(@midiout)
+  @midiout.open_port(out_port)
+end
+
+@modes = []
+@free_channels = (0x0..0x0f).to_set
+@active_channels = {} # locker => chan
+
+def lock_channel(locker)
+  raise 'locker already used' if @active_channels[locker]
+  ch = @free_channels.first
+  @free_channels -= [ch]
+  @active_channels[locker] = ch
+  ch
+end
+
+def release_channel(locker)
+  ch = @active_channels.delete(locker)
+  @free_channels += [ch] if ch
+end
+
+def row(k); k >> 4; end
+def col(k); k % 0x10 ; end
+
+def key_to_freq(k)
+  @base_freq.to_f * row(k) / col(k)
+end
+
+def set_mode(idx, mode_state)
+  if turn_on
+    @modes += [idx]
+  else
+    @modes -= [idx]
+  end
+end
+
+def send_note(key, note_on)
+  f = key_to_freq(key)
+  note_on ? freq_on(f,1) : freq_off(f,1)
+end
+
+def on_bytes(evt, b1, b2)
+  display 'raw', bytes
+  case evt
+  when 0xB0 then set_mode(0x6F - b1, b2 != 0)
+  when 0x90 then send_note(b1, true)
+  when 0x80 then send_note(b1, false)
+  end
+  # @midiout.send_message(*bytes)
+end
+
+def link_in_out
+  #@midiin.receive_channel_message do |b1,b2,b3|
+  #  display 'chan', [b1,b2,b3]
+  #  @midiout.send_channel_message(b1,b2,b3)
+  #end
+
+  @midiin.receive_message do |*bytes|
+    on_bytes(*bytes)
+  end
+end
+
+def start
+  init_out
+  init_in
+  link_in_out
+end
+
+init_out unless @midiout
+play_steps
